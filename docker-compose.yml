@@ -1,0 +1,12 @@
+services:
+  otk:
+    image: alejandrodlrocha/otk:latest
+    container_name: otk
+    restart: unless-stopped
+    ports:
+      - "7654:7654"
+    volumes:
+      - otk-data:/data
+
+volumes:
+  otk-data:
