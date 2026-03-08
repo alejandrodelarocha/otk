@@ -246,80 +246,133 @@ def dashboard():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>OTK Dashboard</title>
+<title>OTK — Token Killer</title>
 <style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body { font-family: 'Courier New', monospace; background: #0d1117; color: #c9d1d9; min-height: 100vh; }
-  header { background: #161b22; border-bottom: 1px solid #30363d; padding: 1.2rem 2rem; display: flex; align-items: center; gap: 1rem; }
-  header h1 { font-size: 1.4rem; color: #58a6ff; }
-  header span { font-size: .85rem; color: #8b949e; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; padding: 2rem; }
-  .card { background: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 1.5rem; }
-  .card .label { font-size: .75rem; color: #8b949e; text-transform: uppercase; letter-spacing: .05em; }
-  .card .value { font-size: 2rem; font-weight: bold; color: #3fb950; margin-top: .3rem; }
-  .card .sub { font-size: .8rem; color: #8b949e; margin-top: .2rem; }
-  .section { padding: 0 2rem 2rem; }
-  .section h2 { font-size: 1rem; color: #8b949e; margin-bottom: 1rem; text-transform: uppercase; letter-spacing: .05em; }
-  table { width: 100%; border-collapse: collapse; }
-  th { text-align: left; font-size: .75rem; color: #8b949e; padding: .5rem; border-bottom: 1px solid #30363d; }
-  td { padding: .5rem; font-size: .85rem; border-bottom: 1px solid #21262d; }
-  .bar { background: #0d1117; border-radius: 4px; height: 6px; margin-top: 4px; }
-  .bar-fill { background: #3fb950; height: 6px; border-radius: 4px; }
-  .spent { color: #f85149; }
-  #title-bar { display: none; }
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#09090b;--surface:#18181b;--border:#27272a;--text:#fafafa;--muted:#71717a;--green:#22c55e;--blue:#3b82f6;--yellow:#eab308}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
+header{background:var(--surface);border-bottom:1px solid var(--border);padding:1rem 2rem;display:flex;align-items:center;justify-content:space-between}
+.logo{display:flex;align-items:center;gap:.6rem}
+.logo-icon{font-size:1.4rem}
+.logo h1{font-size:1.1rem;font-weight:700;letter-spacing:-.02em}
+.logo span{font-size:.75rem;color:var(--muted);background:var(--border);padding:.15rem .5rem;border-radius:999px}
+.status{display:flex;align-items:center;gap:.4rem;font-size:.75rem;color:var(--muted)}
+.dot{width:6px;height:6px;border-radius:50%;background:var(--green);box-shadow:0 0 6px var(--green);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.hero{padding:2rem;display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:1rem}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1.25rem}
+.card-label{font-size:.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:.08em;margin-bottom:.5rem}
+.card-value{font-size:2rem;font-weight:800;line-height:1;letter-spacing:-.03em}
+.card-value.green{color:var(--green)}
+.card-value.blue{color:var(--blue)}
+.card-value.yellow{color:var(--yellow)}
+.card-sub{font-size:.75rem;color:var(--muted);margin-top:.35rem}
+.pct-badge{display:inline-block;background:rgba(34,197,94,.1);color:var(--green);font-size:.7rem;font-weight:600;padding:.15rem .4rem;border-radius:4px;margin-left:.4rem}
+.sections{padding:0 2rem 2rem;display:grid;grid-template-columns:1fr 1fr;gap:1.5rem}
+@media(max-width:700px){.sections{grid-template-columns:1fr}}
+.section{background:var(--surface);border:1px solid var(--border);border-radius:12px;overflow:hidden}
+.section-header{padding:.75rem 1rem;border-bottom:1px solid var(--border);font-size:.75rem;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--muted)}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;font-size:.68rem;color:var(--muted);padding:.5rem 1rem;font-weight:500}
+td{padding:.5rem 1rem;font-size:.8rem;border-top:1px solid var(--border);font-family:'SF Mono','Fira Code',monospace}
+.bar-wrap{display:flex;align-items:center;gap:.5rem}
+.bar{flex:1;background:var(--bg);border-radius:99px;height:5px}
+.bar-fill{background:var(--green);height:5px;border-radius:99px;transition:width .5s ease}
+.pct-text{font-size:.7rem;color:var(--muted);min-width:2.5rem;text-align:right}
+.install{margin:0 2rem 2rem;background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:1rem 1.25rem;display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap}
+.install code{font-family:'SF Mono','Fira Code',monospace;font-size:.8rem;color:var(--blue)}
+.install button{background:var(--border);border:none;color:var(--text);font-size:.75rem;padding:.35rem .75rem;border-radius:6px;cursor:pointer}
+.install button:hover{background:#3f3f46}
+footer{text-align:center;padding:1.5rem;font-size:.7rem;color:var(--muted)}
 </style>
 </head>
 <body>
 <header>
-  <h1>OTK — Token Savings</h1>
-  <span id="updated">Loading...</span>
+  <div class="logo">
+    <span class="logo-icon">⚡</span>
+    <h1>OTK</h1>
+    <span>Token Killer</span>
+  </div>
+  <div class="status"><span class="dot"></span><span id="updated">Loading…</span></div>
 </header>
-<div class="grid">
-  <div class="card"><div class="label">Tokens Saved</div><div class="value" id="saved">—</div><div class="sub" id="pct">—</div></div>
-  <div class="card"><div class="label">Cost Saved (Claude)</div><div class="value" id="cost">—</div><div class="sub">@ $3/1M tokens</div></div>
-  <div class="card"><div class="label">Total Runs</div><div class="value" id="runs">—</div><div class="sub">commands filtered</div></div>
-  <div class="card"><div class="label">Machines</div><div class="value" id="machines">—</div><div class="sub">connected</div></div>
+
+<div class="hero">
+  <div class="card">
+    <div class="card-label">Tokens Saved</div>
+    <div class="card-value green" id="saved">—</div>
+    <div class="card-sub" id="pct">—</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Cost Saved</div>
+    <div class="card-value blue" id="cost">—</div>
+    <div class="card-sub">@ $3 / 1M tokens (Claude Sonnet)</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Commands Filtered</div>
+    <div class="card-value yellow" id="runs">—</div>
+    <div class="card-sub">total runs</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Machines</div>
+    <div class="card-value" id="machines">—</div>
+    <div class="card-sub">connected</div>
+  </div>
 </div>
-<div class="section">
-  <h2>Machines</h2>
-  <table><thead><tr><th>Machine</th><th>Runs</th><th>Tokens Saved</th><th>Avg %</th></tr></thead>
-  <tbody id="machines-table"></tbody></table>
+
+<div class="sections">
+  <div class="section">
+    <div class="section-header">Machines</div>
+    <table>
+      <thead><tr><th>Machine</th><th>Runs</th><th>Saved</th><th>Avg %</th></tr></thead>
+      <tbody id="machines-table"><tr><td colspan="4" style="color:var(--muted);text-align:center">Loading…</td></tr></tbody>
+    </table>
+  </div>
+  <div class="section">
+    <div class="section-header">Recent Commands</div>
+    <table>
+      <thead><tr><th>Command</th><th>Saved</th><th>%</th></tr></thead>
+      <tbody id="recent-table"><tr><td colspan="3" style="color:var(--muted);text-align:center">Loading…</td></tr></tbody>
+    </table>
+  </div>
 </div>
-<div class="section">
-  <h2>Recent Commands</h2>
-  <table><thead><tr><th>Command</th><th>Saved</th><th>%</th></tr></thead>
-  <tbody id="recent-table"></tbody></table>
+
+<div class="install">
+  <code>curl -fsSL https://alejandrodelarocha.com/otk/install | bash</code>
+  <button onclick="navigator.clipboard.writeText('curl -fsSL https://alejandrodelarocha.com/otk/install | bash')">Copy</button>
 </div>
+
+<footer>OTK — Open Token Killer · <a href="https://github.com/alejandrodelarocha/otk" style="color:var(--blue)">GitHub</a></footer>
+
 <script>
+const fmt = n => n >= 1000000 ? (n/1000000).toFixed(2)+'M' : n >= 1000 ? (n/1000).toFixed(1)+'K' : String(n);
 async function load() {
-  const r = await fetch('/api/gain');
-  const d = await r.json();
-  const fmt = n => n >= 1000 ? (n/1000).toFixed(1)+'K' : n;
-  const cost = (d.total_saved * 3 / 1000000).toFixed(4);
-  document.getElementById('saved').textContent = fmt(d.total_saved);
-  document.getElementById('pct').textContent = d.pct + '% reduction';
-  document.getElementById('cost').textContent = '$' + cost;
-  document.getElementById('runs').textContent = d.runs;
-  document.getElementById('machines').textContent = d.machines.length;
-  document.getElementById('updated').textContent = 'Updated ' + new Date().toLocaleTimeString();
-  document.title = 'YOU HAVE SAVED: ' + fmt(d.total_saved) + ' tokens | OTK';
-  const mt = document.getElementById('machines-table');
-  mt.innerHTML = d.machines.map(m =>
-    `<tr><td>${m.machine}</td><td>${m.runs}</td><td>${fmt(m.total_saved)}</td>
-     <td><div>${m.avg_pct}%</div><div class="bar"><div class="bar-fill" style="width:${m.avg_pct}%"></div></div></td></tr>`
-  ).join('');
-  const rt = document.getElementById('recent-table');
-  rt.innerHTML = d.recent.map(r =>
-    `<tr><td>${r.cmd}</td><td>${fmt(r.saved)}</td><td>${r.pct}%</td></tr>`
-  ).join('');
+  try {
+    const r = await fetch('/api/gain'); const d = await r.json();
+    document.getElementById('saved').innerHTML = fmt(d.total_saved) + `<span class="pct-badge">${d.pct}%</span>`;
+    document.getElementById('pct').textContent = d.pct + '% reduction vs unfiltered';
+    document.getElementById('cost').textContent = '$' + (d.total_saved * 3 / 1000000).toFixed(4);
+    document.getElementById('runs').textContent = d.runs.toLocaleString();
+    document.getElementById('machines').textContent = d.machines.length;
+    document.getElementById('updated').textContent = 'Live · ' + new Date().toLocaleTimeString();
+    document.title = '⚡ ' + fmt(d.total_saved) + ' tokens saved | OTK';
+    document.getElementById('machines-table').innerHTML = d.machines.length
+      ? d.machines.map(m => `<tr>
+          <td>${m.machine}</td><td>${m.runs}</td><td>${fmt(m.total_saved)}</td>
+          <td><div class="bar-wrap"><div class="bar"><div class="bar-fill" style="width:${Math.min(m.avg_pct,100)}%"></div></div><span class="pct-text">${m.avg_pct}%</span></div></td>
+        </tr>`).join('')
+      : '<tr><td colspan="4" style="color:var(--muted);text-align:center">No data yet</td></tr>';
+    document.getElementById('recent-table').innerHTML = d.recent && d.recent.length
+      ? d.recent.map(r => `<tr><td>${r.cmd}</td><td>${fmt(r.saved)}</td><td>${r.pct}%</td></tr>`).join('')
+      : '<tr><td colspan="3" style="color:var(--muted);text-align:center">No data yet</td></tr>';
+  } catch(e) { document.getElementById('updated').textContent = 'Offline'; }
 }
-load();
-setInterval(load, 10000);
+load(); setInterval(load, 10000);
 </script>
 </body>
 </html>""")
 
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 def root():
-    return {"status": "ok", "service": "OTK Server", "endpoints": ["/api/gain", "/api/filter", "/dashboard"]}
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url="/dashboard")
