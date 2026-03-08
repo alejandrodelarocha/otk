@@ -100,6 +100,7 @@ def filter_via_server(cmd, raw):
     import urllib.request
     url = get_server()
     if not url: return None, False
+    if len(raw) < 200: return (raw, False)  # too small to bother compressing
     try:
         payload = json.dumps({"cmd":" ".join(cmd),"output":raw,"machine":socket.gethostname()}).encode()
         req = urllib.request.Request(url+"/api/filter", data=payload, headers={"Content-Type":"application/json"}, method="POST")
@@ -173,10 +174,21 @@ def main():
         print(f"{DIM}  ⚡ otk: {YELLOW}skipped AI — sensitive data detected (privacy){NC}",file=sys.stderr)
     else:
         saved=max(0,orig_tok-filt_tok); pct=round(saved/orig_tok*100) if orig_tok else 0
+        import urllib.request
+        url=get_server()
+        gs,gr,gp=0,0,0
+        if url:
+            try:
+                with urllib.request.urlopen(url+"/api/gain",timeout=1) as r:
+                    gd=json.loads(r.read()); gs=gd.get("total_saved",0); gr=gd.get("runs",0); gp=gd.get("pct",0)
+            except: pass
+        if gs==0:
+            ga=load_analytics(); gs=ga["total_saved"]; gr=ga["runs"]; gp=round(gs/ga["total_original"]*100) if ga["total_original"] else 0
+        gcost=gs*3.0/1_000_000
         if saved==0:
-            print(f"{DIM}  ⚡ otk: nothing to compress ({orig_tok:,} tokens){NC}",file=sys.stderr)
+            print(f"{DIM}  ⚡ otk: nothing to compress ({orig_tok:,} tokens) · total {BLUE}{gs:,} saved ({gp}%) ${gcost:.4f}{NC}{DIM} across {gr} runs{NC}",file=sys.stderr)
         else:
-            print(f"{DIM}  ⚡ otk: {BLUE}{saved:,} tokens saved ({pct}%){NC}{DIM} · {orig_tok:,}→{filt_tok:,}{NC}",file=sys.stderr)
+            print(f"{DIM}  ⚡ otk: {BLUE}{saved:,} tokens saved ({pct}%){NC}{DIM} · {orig_tok:,}→{filt_tok:,} · total {gs:,} saved ({gp}%) ${gcost:.4f} across {gr} runs{NC}",file=sys.stderr)
     sys.exit(result.returncode)
 
 if __name__=="__main__": main()
@@ -241,11 +253,36 @@ if ! command -v jq &>/dev/null || ! command -v otk &>/dev/null; then exit 0; fi
 INPUT=$(cat); CMD=$(echo "$INPUT" | jq -r '.tool_input.command // empty')
 [ -z "$CMD" ] && exit 0
 BASE=$(echo "$CMD" | awk '{print $1}' | sed 's|.*/||')
-if echo "git npm pnpm yarn docker pip cargo" | grep -qw "$BASE" && ! echo "$CMD" | grep -q "^otk "; then
-  UPDATED=$(echo "$INPUT" | jq -c --arg cmd "otk $CMD" '.tool_input.command = $cmd')
+
+# Shell builtins and TTY-requiring commands — never wrap with otk
+SKIP="cd export source alias unset set pwd exit return true false type builtin command eval exec vim nano less more top htop ssh python python3 node ruby irb psql mysql sqlite3 watch man ftp sftp telnet screen tmux"
+
+rewrite() {
+  local cmd="$1"
+  UPDATED=$(echo "$INPUT" | jq -c --arg cmd "$cmd" '.tool_input.command = $cmd')
   jq -n --argjson u "$(echo $UPDATED | jq -c '.tool_input')" \
     '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","permissionDecisionReason":"OTK","updatedInput":$u}}'
+}
+
+# Already wrapped
+echo "$CMD" | grep -q "^otk " && exit 0
+
+# Handle "cd X && real_cmd args" pattern — wrap just the real_cmd
+if echo "$CMD" | grep -qE '^cd [^ ]+ && ' && ! echo "$SKIP" | grep -qw "$BASE"; then
+  REST=$(echo "$CMD" | sed 's/^cd [^ ]* && //')
+  REST_BASE=$(echo "$REST" | awk '{print $1}' | sed 's|.*/||')
+  if ! echo "$SKIP" | grep -qw "$REST_BASE" && ! echo "$REST" | grep -q "^otk "; then
+    NEW_CMD=$(echo "$CMD" | sed "s|&& ${REST}|\&\& otk ${REST}|")
+    rewrite "$NEW_CMD"
+  fi
+  exit 0
 fi
+
+# Skip builtins and TTY commands
+echo "$SKIP" | grep -qw "$BASE" && exit 0
+
+# Wrap everything else
+rewrite "otk $CMD"
 HOOKEOF
   chmod +x "$CLAUDE_HOOK"
   if [ -f "$CLAUDE_SETTINGS" ]; then
