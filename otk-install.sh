@@ -57,6 +57,16 @@ def get_server():
                 return line.split("=",1)[1].strip().strip('"')
     return None
 
+def get_api_key():
+    if "OTK_API_KEY" in os.environ:
+        return os.environ["OTK_API_KEY"]
+    cfg = Path.home() / ".config/otk/config.toml"
+    if cfg.exists():
+        for line in cfg.read_text().splitlines():
+            if line.startswith("api_key"):
+                return line.split("=",1)[1].strip().strip('"')
+    return ""
+
 def strip_ansi(t): return re.sub(r'\x1b\[[0-9;]*[mKHJABCDGsu]','',t)
 def dedup(lines):
     seen,out = set(),[]
@@ -103,7 +113,11 @@ def filter_via_server(cmd, raw):
     if len(raw) < 200: return (raw, False)  # too small to bother compressing
     try:
         payload = json.dumps({"cmd":" ".join(cmd),"output":raw,"machine":socket.gethostname()}).encode()
-        req = urllib.request.Request(url+"/api/filter", data=payload, headers={"Content-Type":"application/json"}, method="POST")
+        headers = {"Content-Type": "application/json"}
+        key = get_api_key()
+        if key:
+            headers["X-OTK-Key"] = key
+        req = urllib.request.Request(url+"/api/filter", data=payload, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=2) as r:
             d = json.loads(r.read())
             return d["filtered"], d.get("privacy", False)
@@ -114,6 +128,38 @@ def load_analytics():
     if ANALYTICS.exists(): return json.loads(ANALYTICS.read_text())
     return {"total_saved":0,"total_original":0,"runs":0,"history":[]}
 def save_analytics(d): ANALYTICS.write_text(json.dumps(d,indent=2))
+
+GAIN_CACHE = Path.home() / ".config/otk/gain_cache.json"
+def get_cached_gain():
+    """Return (gs, gr, gp) from cache if fresh (<60s), else fetch from server and cache."""
+    import urllib.request
+    url = get_server()
+    # Try cache first
+    if GAIN_CACHE.exists():
+        try:
+            c = json.loads(GAIN_CACHE.read_text())
+            if time.time() - c.get("ts", 0) < 60:
+                return c.get("gs", 0), c.get("gr", 0), c.get("gp", 0)
+        except: pass
+    # Fetch from server
+    if url:
+        try:
+            key = get_api_key()
+            headers = {"X-OTK-Key": key} if key else {}
+            req = urllib.request.Request(url+"/api/gain", headers=headers)
+            with urllib.request.urlopen(req, timeout=1) as r:
+                gd = json.loads(r.read())
+                gs, gr, gp = gd.get("total_saved",0), gd.get("runs",0), gd.get("pct",0)
+                GAIN_CACHE.parent.mkdir(parents=True, exist_ok=True)
+                GAIN_CACHE.write_text(json.dumps({"gs":gs,"gr":gr,"gp":gp,"ts":time.time()}))
+                return gs, gr, gp
+        except: pass
+    # Fall back to local analytics
+    ga = load_analytics()
+    gs = ga["total_saved"]; gr = ga["runs"]
+    gp = round(gs/ga["total_original"]*100) if ga["total_original"] else 0
+    return gs, gr, gp
+
 def record(cmd, orig, filt):
     saved=max(0,orig-filt); d=load_analytics()
     d["total_saved"]+=saved; d["total_original"]+=orig; d["runs"]+=1
@@ -128,7 +174,10 @@ def cmd_gain(history=False, model="claude-sonnet"):
     url=get_server()
     if url:
         try:
-            with urllib.request.urlopen(url+"/api/gain",timeout=3) as r:
+            key=get_api_key()
+            _headers={"X-OTK-Key":key} if key else {}
+            _req=urllib.request.Request(url+"/api/gain",headers=_headers)
+            with urllib.request.urlopen(_req,timeout=3) as r:
                 d=json.loads(r.read())
             saved=d["total_saved"]; runs=d["runs"]; pct=d["pct"]
             cost=saved*price/1_000_000
@@ -165,7 +214,7 @@ def main():
     raw=result.stdout+result.stderr
     filtered,privacy=filter_via_server(args,raw)
     if filtered is None:
-        print("otk: server unreachable — check your connection or visit "+str(get_server()),file=sys.stderr); sys.exit(1)
+        filtered=filter_output(args,raw); privacy=False
     orig_tok=count_tokens(raw); filt_tok=count_tokens(filtered)
     record(args,orig_tok,filt_tok)
     BLUE="\033[0;34m"; DIM="\033[2m"; NC="\033[0m"; YELLOW="\033[0;33m"
@@ -174,21 +223,12 @@ def main():
         print(f"{DIM}  ⚡ otk: {YELLOW}skipped AI — sensitive data detected (privacy){NC}",file=sys.stderr)
     else:
         saved=max(0,orig_tok-filt_tok); pct=round(saved/orig_tok*100) if orig_tok else 0
-        import urllib.request
-        url=get_server()
-        gs,gr,gp=0,0,0
-        if url:
-            try:
-                with urllib.request.urlopen(url+"/api/gain",timeout=1) as r:
-                    gd=json.loads(r.read()); gs=gd.get("total_saved",0); gr=gd.get("runs",0); gp=gd.get("pct",0)
-            except: pass
-        if gs==0:
-            ga=load_analytics(); gs=ga["total_saved"]; gr=ga["runs"]; gp=round(gs/ga["total_original"]*100) if ga["total_original"] else 0
-        gcost=gs*3.0/1_000_000
-        if saved==0:
-            print(f"{DIM}  ⚡ otk: nothing to compress ({orig_tok:,} tokens) · total {BLUE}{gs:,} saved ({gp}%) ${gcost:.4f}{NC}{DIM} across {gr} runs{NC}",file=sys.stderr)
+        gs, gr, gp = get_cached_gain()
+        gcost = gs * 3.0 / 1_000_000
+        if saved == 0:
+            print(f"{DIM}  ⚡ otk: nothing to compress ({orig_tok:,} tokens) · total {BLUE}{gs:,} saved ({gp}%) ${gcost:.4f}{NC}{DIM} across {gr} runs{NC}", file=sys.stderr)
         else:
-            print(f"{DIM}  ⚡ otk: {BLUE}{saved:,} tokens saved ({pct}%){NC}{DIM} · {orig_tok:,}→{filt_tok:,} · total {gs:,} saved ({gp}%) ${gcost:.4f} across {gr} runs{NC}",file=sys.stderr)
+            print(f"{DIM}  ⚡ otk: {BLUE}{saved:,} tokens saved ({pct}%){NC}{DIM} · {orig_tok:,}→{filt_tok:,} · total {gs:,} saved ({gp}%) ${gcost:.4f} across {gr} runs{NC}", file=sys.stderr)
     sys.exit(result.returncode)
 
 if __name__=="__main__": main()
@@ -272,7 +312,8 @@ if echo "$CMD" | grep -qE '^cd [^ ]+ && ' && ! echo "$SKIP" | grep -qw "$BASE"; 
   REST=$(echo "$CMD" | sed 's/^cd [^ ]* && //')
   REST_BASE=$(echo "$REST" | awk '{print $1}' | sed 's|.*/||')
   if ! echo "$SKIP" | grep -qw "$REST_BASE" && ! echo "$REST" | grep -q "^otk "; then
-    NEW_CMD=$(echo "$CMD" | sed "s|&& ${REST}|\&\& otk ${REST}|")
+    PREFIX="${CMD%%&&*}&& "
+    NEW_CMD="${PREFIX}otk ${REST}"
     rewrite "$NEW_CMD"
   fi
   exit 0

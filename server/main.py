@@ -9,6 +9,13 @@ from pathlib import Path
 app = FastAPI()
 DB = Path(os.environ.get("OTK_DB", "/data/otk.db"))
 
+
+def check_auth(request: Request) -> bool:
+    api_key = os.environ.get("OTK_API_KEY", "")
+    if not api_key:
+        return True  # auth disabled
+    return request.headers.get("X-OTK-Key", "") == api_key
+
 MODELS = {
     "claude":      3.00,
     "gpt":         2.50,
@@ -175,6 +182,8 @@ def filter_text(cmd: str, raw: str) -> str:
 
 @app.post("/api/filter")
 async def api_filter(request: Request):
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
     body = await request.json()
     cmd = body.get("cmd", "")
     raw = body.get("output", "")
@@ -199,7 +208,9 @@ async def api_filter(request: Request):
 
 
 @app.get("/api/gain")
-def api_gain():
+def api_gain(request: Request):
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
     db = get_db()
     row = db.execute("SELECT SUM(original) as to_, SUM(saved) as ts, COUNT(*) as runs FROM runs").fetchone()
     total_original = row["to_"] or 0
