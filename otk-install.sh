@@ -3,12 +3,12 @@
 #  OTK Client Installer — All AI Tools
 #  Works with: Claude Code · Cursor · VS Code · any terminal
 #
-#  Usage: curl -fsSL https://alejandrodelarocha.com/otk/install | bash
+#  Usage:
+#    curl -fsSL https://alejandrodelarocha.com/otk/install | bash
+#    curl -fsSL https://alejandrodelarocha.com/otk/install | bash -s -- https://your-server.com
+#    curl -fsSL https://alejandrodelarocha.com/otk/install | bash -s -- --local   # no server
 # ═══════════════════════════════════════════════════════════
 
-set -e
-
-OTK_SERVER=""
 OTK_BIN="$HOME/.local/bin/otk"
 OTK_CFG="$HOME/.config/otk/config.toml"
 MACHINE=$(hostname)
@@ -22,19 +22,32 @@ warn()  { echo -e "  ${YELLOW}⚠ $1${NC}"; }
 echo -e "\n${GREEN}⚡ OTK — All AI Tools Installer${NC}"
 echo -e "${DIM}Machine: $MACHINE${NC}\n"
 
-# ── 0. VPS prompt ─────────────────────────────────────────────
-USER_VPS="${1:-${OTK_SERVER_URL:-}}"
-if [ -z "$USER_VPS" ]; then
-  while true; do
-    printf "Enter your VPS URL: "
-    read -r USER_VPS 2>/dev/null || { warn "No TTY — pass URL as arg: bash otk-install.sh https://yourserver.com"; exit 1; }
-    [ -n "$USER_VPS" ] && break
-    warn "VPS URL is required."
-  done
+# ── 0. Server URL + API Key ───────────────────────────────────
+ARG="${1:-${OTK_SERVER_URL:-}}"
+OTK_SERVER=""
+OTK_KEY="${OTK_API_KEY:-}"
+
+if [ "$ARG" = "--local" ]; then
+  warn "Local-only mode — no server, using built-in filters"
+elif [ -n "$ARG" ]; then
+  OTK_SERVER="${ARG%/}"
+  ok "Using server: $OTK_SERVER"
+else
+  printf "Enter your OTK server URL (or press Enter for local-only mode): "
+  read -r USER_VPS 2>/dev/null || USER_VPS=""
+  if [ -n "$USER_VPS" ]; then
+    OTK_SERVER="${USER_VPS%/}"
+    ok "Using server: $OTK_SERVER"
+  else
+    warn "No server — using local filtering only"
+  fi
 fi
-OTK_SERVER="${USER_VPS%/}"
-ok "Using VPS: $OTK_SERVER"
-echo ""
+
+if [ -n "$OTK_SERVER" ] && [ -z "$OTK_KEY" ]; then
+  printf "Enter API key (or press Enter to skip): "
+  read -r OTK_KEY 2>/dev/null || OTK_KEY=""
+  [ -n "$OTK_KEY" ] && ok "API key set" || skip "No API key (server must allow unauthenticated access)"
+fi
 
 # ── 1. OTK binary ────────────────────────────────────────────
 step "Installing OTK binary..."
@@ -46,6 +59,7 @@ import sys, subprocess, re, json, os, time, socket
 from pathlib import Path
 
 ANALYTICS = Path.home() / ".config/otk/analytics.json"
+GAIN_CACHE = Path.home() / ".config/otk/gain_cache.json"
 
 def get_server():
     cfg = Path.home() / ".config/otk/config.toml"
@@ -54,7 +68,8 @@ def get_server():
     if cfg.exists():
         for line in cfg.read_text().splitlines():
             if line.startswith("server_url"):
-                return line.split("=",1)[1].strip().strip('"')
+                v = line.split("=",1)[1].strip().strip('"')
+                return v if v else None
     return None
 
 def get_api_key():
@@ -68,41 +83,70 @@ def get_api_key():
     return ""
 
 def strip_ansi(t): return re.sub(r'\x1b\[[0-9;]*[mKHJABCDGsu]','',t)
-def dedup(lines):
-    seen,out = set(),[]
-    for l in lines:
-        if l not in seen: seen.add(l); out.append(l)
-    return out
-def truncate(lines, n=80):
+def truncate(lines, n=200):
     if len(lines)<=n: return lines
     h=n//2; return lines[:h]+[f"...({len(lines)-n} omitted)..."]+lines[-h:]
 
 def filter_git(out, sub):
     lines = out.splitlines()
-    if sub=="diff": return "\n".join(l for l in lines if l.startswith(("diff --git","---","+++","@@","+","-","index ")))
+    if sub=="diff":
+        return "\n".join(l for l in lines if l and (
+            l.startswith(("diff --git","---","+++","@@","index ","new file","deleted file"))
+            or (l[0] in ("+","-") and not l.startswith(("---","+++")))
+        ))
     if sub in("log","reflog"): return "\n".join(lines[:40])
+    if sub=="status":
+        result, untracked, uc = [], False, 0
+        for l in lines:
+            if "Untracked files:" in l: untracked=True; result.append(l)
+            elif untracked and l.startswith("\t"):
+                uc+=1
+                if uc<=10: result.append(l)
+                elif uc==11: result.append(f"\t... and more untracked files")
+            else: untracked=False; result.append(l)
+        return "\n".join(result)
+    if sub in("push","fetch","pull"):
+        noise = re.compile(r'^(Enumerating|Counting|Compressing|Writing|Total|remote: Counting|remote: Compressing) ')
+        return "\n".join(l for l in lines if not noise.match(l))
     return out
 def filter_npm(out, sub):
-    lines = [l for l in out.splitlines() if not re.match(r'^npm (warn|notice|timing|http)',l,re.I)]
-    if sub in("install","i","ci"):
-        s=[l for l in lines if re.match(r'added|removed|changed|audited|found',l)]
-        return "\n".join(s) if s else "\n".join(truncate(lines))
-    return "\n".join(truncate(lines))
+    lines = out.splitlines()
+    noise = re.compile(r'^(npm (warn EBADENGINE|timing|http|notice)|WARN deprecated)',re.I)
+    filtered = [l for l in lines if not noise.match(l)]
+    if sub in("install","i","ci","add"):
+        summary=[l for l in filtered if re.search(r'added|removed|changed|packages in',l,re.I)]
+        warnings=[l for l in filtered if re.search(r'warn|error',l,re.I)]
+        return "\n".join(warnings+summary) if (summary or warnings) else "\n".join(truncate(filtered,20))
+    return "\n".join(truncate(filtered))
 def filter_docker(out, sub):
     lines = out.splitlines()
-    if sub=="build": return "\n".join(l for l in lines if re.match(r'Step \d+|ERROR|-->',l))
+    if sub=="build": return "\n".join(l for l in lines if re.match(r'Step \d+|ERROR|-->',l)) or "\n".join(truncate(lines,20))
+    if sub=="ps": return "\n".join(truncate(lines,30))
     return "\n".join(truncate(lines))
-def filter_generic(out):
-    lines = [l for l in strip_ansi(out).splitlines() if l.strip()]
-    return "\n".join(truncate(dedup(lines)))
+def filter_test(out):
+    lines = out.splitlines()
+    noise=re.compile(r'^(test .* \.\.\. ok|\.+$|ok\s+\S+\s+\([\d.]+s\)|\s*PASS\s*$)',re.I)
+    important=re.compile(r'(FAIL|ERROR|panic|assert|Exception|Traceback|FAILED|error\[|\d+ (test|passed|failed|error))',re.I)
+    keep=[l for l in lines if not noise.match(l.strip()) or important.search(l)]
+    for l in lines[-10:]:
+        if l not in keep: keep.append(l)
+    return "\n".join(truncate(keep,100))
 def filter_output(cmd, raw):
-    if not cmd: return filter_generic(raw)
-    base = cmd[0].split("/")[-1]; sub = cmd[1] if len(cmd)>1 else ""
-    clean = strip_ansi(raw)
+    if not cmd: return strip_ansi(raw)
+    base=cmd[0].split("/")[-1]; sub=cmd[1] if len(cmd)>1 else ""
+    clean=strip_ansi(raw)
+    lines=[l for l in clean.splitlines() if l.strip()]
     if base=="git": return filter_git(clean, sub)
     if base in("npm","pnpm","yarn"): return filter_npm(clean, sub)
     if base=="docker": return filter_docker(clean, sub)
-    return filter_generic(clean)
+    if base in("pytest","py.test"): return filter_test(clean)
+    if base=="cargo" and sub=="test": return filter_test(clean)
+    if base=="go" and sub=="test": return filter_test(clean)
+    if base in("grep","rg","ag"):
+        filtered=[l for l in lines if not re.match(r'^(Binary file|grep: )',l)]
+        return "\n".join(truncate(filtered,300))
+    if base in("ls","tree","find"): return clean  # never truncate file listings
+    return "\n".join(truncate(lines,200))
 
 def count_tokens(t): return max(1, int(len(t)/4.0))
 
@@ -110,13 +154,12 @@ def filter_via_server(cmd, raw):
     import urllib.request
     url = get_server()
     if not url: return None, False
-    if len(raw) < 200: return (raw, False)  # too small to bother compressing
+    if len(raw) < 200: return (raw, False)
     try:
         payload = json.dumps({"cmd":" ".join(cmd),"output":raw,"machine":socket.gethostname()}).encode()
         headers = {"Content-Type": "application/json"}
         key = get_api_key()
-        if key:
-            headers["X-OTK-Key"] = key
+        if key: headers["X-OTK-Key"] = key
         req = urllib.request.Request(url+"/api/filter", data=payload, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=2) as r:
             d = json.loads(r.read())
@@ -129,36 +172,30 @@ def load_analytics():
     return {"total_saved":0,"total_original":0,"runs":0,"history":[]}
 def save_analytics(d): ANALYTICS.write_text(json.dumps(d,indent=2))
 
-GAIN_CACHE = Path.home() / ".config/otk/gain_cache.json"
 def get_cached_gain():
-    """Return (gs, gr, gp) from cache if fresh (<60s), else fetch from server and cache."""
     import urllib.request
     url = get_server()
-    # Try cache first
     if GAIN_CACHE.exists():
         try:
             c = json.loads(GAIN_CACHE.read_text())
-            if time.time() - c.get("ts", 0) < 60:
-                return c.get("gs", 0), c.get("gr", 0), c.get("gp", 0)
+            if time.time() - c.get("ts",0) < 60:
+                return c.get("gs",0), c.get("gr",0), c.get("gp",0)
         except: pass
-    # Fetch from server
     if url:
         try:
-            key = get_api_key()
-            headers = {"X-OTK-Key": key} if key else {}
-            req = urllib.request.Request(url+"/api/gain", headers=headers)
-            with urllib.request.urlopen(req, timeout=1) as r:
-                gd = json.loads(r.read())
-                gs, gr, gp = gd.get("total_saved",0), gd.get("runs",0), gd.get("pct",0)
-                GAIN_CACHE.parent.mkdir(parents=True, exist_ok=True)
+            key=get_api_key()
+            headers={"X-OTK-Key":key} if key else {}
+            req=urllib.request.Request(url+"/api/gain",headers=headers)
+            with urllib.request.urlopen(req,timeout=1) as r:
+                gd=json.loads(r.read())
+                gs,gr,gp=gd.get("total_saved",0),gd.get("runs",0),gd.get("pct",0)
+                GAIN_CACHE.parent.mkdir(parents=True,exist_ok=True)
                 GAIN_CACHE.write_text(json.dumps({"gs":gs,"gr":gr,"gp":gp,"ts":time.time()}))
-                return gs, gr, gp
+                return gs,gr,gp
         except: pass
-    # Fall back to local analytics
-    ga = load_analytics()
-    gs = ga["total_saved"]; gr = ga["runs"]
-    gp = round(gs/ga["total_original"]*100) if ga["total_original"] else 0
-    return gs, gr, gp
+    ga=load_analytics(); gs=ga["total_saved"]; gr=ga["runs"]
+    gp=round(gs/ga["total_original"]*100) if ga["total_original"] else 0
+    return gs,gr,gp
 
 def record(cmd, orig, filt):
     saved=max(0,orig-filt); d=load_analytics()
@@ -175,9 +212,8 @@ def cmd_gain(history=False, model="claude-sonnet"):
     if url:
         try:
             key=get_api_key()
-            _headers={"X-OTK-Key":key} if key else {}
-            _req=urllib.request.Request(url+"/api/gain",headers=_headers)
-            with urllib.request.urlopen(_req,timeout=3) as r:
+            _h={"X-OTK-Key":key} if key else {}
+            with urllib.request.urlopen(urllib.request.Request(url+"/api/gain",headers=_h),timeout=3) as r:
                 d=json.loads(r.read())
             saved=d["total_saved"]; runs=d["runs"]; pct=d["pct"]
             cost=saved*price/1_000_000
@@ -223,12 +259,11 @@ def main():
         print(f"{DIM}  ⚡ otk: {YELLOW}skipped AI — sensitive data detected (privacy){NC}",file=sys.stderr)
     else:
         saved=max(0,orig_tok-filt_tok); pct=round(saved/orig_tok*100) if orig_tok else 0
-        gs, gr, gp = get_cached_gain()
-        gcost = gs * 3.0 / 1_000_000
-        if saved == 0:
-            print(f"{DIM}  ⚡ otk: nothing to compress ({orig_tok:,} tokens) · total {BLUE}{gs:,} saved ({gp}%) ${gcost:.4f}{NC}{DIM} across {gr} runs{NC}", file=sys.stderr)
+        gs,gr,gp=get_cached_gain(); gcost=gs*3.0/1_000_000
+        if saved==0:
+            print(f"{DIM}  ⚡ otk: nothing to compress ({orig_tok:,} tokens) · total {BLUE}{gs:,} saved ({gp}%) ${gcost:.4f}{NC}{DIM} across {gr} runs{NC}",file=sys.stderr)
         else:
-            print(f"{DIM}  ⚡ otk: {BLUE}{saved:,} tokens saved ({pct}%){NC}{DIM} · {orig_tok:,}→{filt_tok:,} · total {gs:,} saved ({gp}%) ${gcost:.4f} across {gr} runs{NC}", file=sys.stderr)
+            print(f"{DIM}  ⚡ otk: {BLUE}{saved:,} tokens saved ({pct}%){NC}{DIM} · {orig_tok:,}→{filt_tok:,} · total {gs:,} saved ({gp}%) ${gcost:.4f} across {gr} runs{NC}",file=sys.stderr)
     sys.exit(result.returncode)
 
 if __name__=="__main__": main()
@@ -242,39 +277,53 @@ mkdir -p "$(dirname "$OTK_CFG")"
 cat > "$OTK_CFG" << EOF
 server_url = "$OTK_SERVER"
 machine    = "$MACHINE"
+api_key    = "$OTK_KEY"
 EOF
 ok "Config → $OTK_CFG"
 
 # ── 3. Shell functions (zsh + bash + fish) ────────────────────
 step "Installing shell functions..."
 
-OTK_SHELL_BLOCK='
-# ── OTK: funnels commands through token killer ───────────────
-export PATH="$HOME/.local/bin:$PATH"
-_OTK_CMDS=(git npm pnpm yarn docker pip cargo)
-for _cmd in "${_OTK_CMDS[@]}"; do
-  eval "function $_cmd() { otk $_cmd \"\$@\"; }"
-done
-unset _cmd _OTK_CMDS
-# ─────────────────────────────────────────────────────────────
-'
+# Commands to wrap in the terminal (matches Claude Code hook)
+OTK_CMDS="git npm pnpm yarn docker pip pip3 cargo pytest ruff go make kubectl helm"
+
+OTK_SHELL_MARKER="# ── OTK token killer"
+OTK_SHELL_BLOCK="${OTK_SHELL_MARKER} ──────────────────────────────
+[ -f \"\$HOME/.local/bin/otk\" ] && export PATH=\"\$HOME/.local/bin:\$PATH\"
+_otk_wrap() { for _c in $OTK_CMDS; do
+  eval \"_otk_\${_c}() { \\\$HOME/.local/bin/otk \$_c \\\"\\\$@\\\"; }\"
+  alias \$_c=\"_otk_\${_c}\"
+done; unset _c; }
+_otk_wrap; unset -f _otk_wrap
+# ────────────────────────────────────────────────────────────"
 
 for RC in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile"; do
-  if [ -f "$RC" ] && ! grep -q "OTK: funnels" "$RC"; then
-    echo "$OTK_SHELL_BLOCK" >> "$RC"; ok "Added to $(basename $RC)"
-  elif [ -f "$RC" ]; then skip "$(basename $RC) already configured"; fi
+  if [ -f "$RC" ]; then
+    if grep -q "$OTK_SHELL_MARKER" "$RC"; then
+      # Remove old block and re-add updated one
+      python3 -c "
+import re, pathlib
+p = pathlib.Path('$RC')
+txt = p.read_text()
+txt = re.sub(r'# ── OTK token killer.*?# ──+\n', '', txt, flags=re.DOTALL)
+p.write_text(txt)
+" 2>/dev/null
+    fi
+    printf '\n%s\n' "$OTK_SHELL_BLOCK" >> "$RC"
+    ok "Updated $(basename $RC)"
+  fi
 done
 
 # Fish shell
 FISH_CONF="$HOME/.config/fish/conf.d/otk.fish"
 if command -v fish &>/dev/null; then
   mkdir -p "$(dirname "$FISH_CONF")"
-  cat > "$FISH_CONF" << 'FISHEOF'
+  cat > "$FISH_CONF" << FISHEOF
 # OTK — token killer for fish shell
-set -gx PATH $HOME/.local/bin $PATH
-for cmd in git npm pnpm yarn docker pip cargo
-  function $cmd --wraps $cmd
-    otk $cmd $argv
+fish_add_path \$HOME/.local/bin
+for cmd in $OTK_CMDS
+  function \$cmd --wraps \$cmd
+    \$HOME/.local/bin/otk \$cmd \$argv
   end
 end
 FISHEOF
@@ -308,7 +357,7 @@ rewrite() {
 echo "$CMD" | grep -q "^otk " && exit 0
 
 # Handle "cd X && real_cmd args" pattern — wrap just the real_cmd
-if echo "$CMD" | grep -qE '^cd [^ ]+ && ' && ! echo "$SKIP" | grep -qw "$BASE"; then
+if echo "$CMD" | grep -qE '^cd [^ ]+ && '; then
   REST=$(echo "$CMD" | sed 's/^cd [^ ]* && //')
   REST_BASE=$(echo "$REST" | awk '{print $1}' | sed 's|.*/||')
   if ! echo "$SKIP" | grep -qw "$REST_BASE" && ! echo "$REST" | grep -q "^otk "; then
@@ -327,18 +376,21 @@ rewrite "otk $CMD"
 HOOKEOF
   chmod +x "$CLAUDE_HOOK"
   if [ -f "$CLAUDE_SETTINGS" ]; then
-    python3 - << PYEOF
+    python3 - << PYEOF2
 import json, pathlib
 p = pathlib.Path("$CLAUDE_SETTINGS")
-d = json.loads(p.read_text())
+try:
+    d = json.loads(p.read_text())
+except:
+    d = {}
 d.setdefault("hooks", {}).setdefault("PreToolUse", [])
 d["hooks"]["PreToolUse"] = [h for h in d["hooks"]["PreToolUse"] if "rtk" not in str(h) and "otk" not in str(h)]
 d["hooks"]["PreToolUse"].append({"matcher":"Bash","hooks":[{"type":"command","command":"$CLAUDE_HOOK"}]})
 p.write_text(json.dumps(d, indent=2))
-PYEOF
+PYEOF2
     ok "Claude Code hook registered"
   else
-    ok "Hook installed (settings.json not found — add hook manually)"
+    ok "Hook installed (no settings.json — hook will activate when Claude Code runs)"
   fi
 else
   skip "Claude Code not found"
@@ -347,160 +399,65 @@ fi
 # ── 5. VS Code ────────────────────────────────────────────────
 step "VS Code..."
 VSCODE_SETTINGS="$HOME/Library/Application Support/Code/User/settings.json"
-if [ ! -f "$VSCODE_SETTINGS" ]; then
-  VSCODE_SETTINGS="$HOME/.config/Code/User/settings.json"
-fi
+[ ! -f "$VSCODE_SETTINGS" ] && VSCODE_SETTINGS="$HOME/.config/Code/User/settings.json"
 if [ -f "$VSCODE_SETTINGS" ]; then
-  python3 - << PYEOF
+  python3 - << PYEOF3
 import json, pathlib
 p = pathlib.Path("$VSCODE_SETTINGS")
-d = json.loads(p.read_text()) if p.exists() else {}
-# Set integrated terminal to load OTK shell functions
-d["terminal.integrated.env.osx"]  = d.get("terminal.integrated.env.osx", {})
-d["terminal.integrated.env.linux"] = d.get("terminal.integrated.env.linux", {})
-d["terminal.integrated.env.osx"]["PATH"]   = "$HOME/.local/bin:" + d["terminal.integrated.env.osx"].get("PATH","") + ":\${env:PATH}"
-d["terminal.integrated.env.linux"]["PATH"] = "$HOME/.local/bin:" + d["terminal.integrated.env.linux"].get("PATH","") + ":\${env:PATH}"
-# Tasks: wrap common commands
-tasks_file = p.parent / "tasks.json"
-tasks = json.loads(tasks_file.read_text()) if tasks_file.exists() else {"version":"2.0.0","tasks":[]}
-otk_tasks = [
-    {"label":f"OTK: {cmd}","type":"shell","command":f"otk {cmd}","args":["\${input:args}"],"group":"build"}
-    for cmd in ["git status","git log","docker ps","npm install"]
-]
-existing_labels = {t["label"] for t in tasks["tasks"]}
-tasks["tasks"] += [t for t in otk_tasks if t["label"] not in existing_labels]
-tasks_file.write_text(json.dumps(tasks, indent=2))
+try:
+    d = json.loads(p.read_text())
+except:
+    d = {}
+for key in ["terminal.integrated.env.osx","terminal.integrated.env.linux"]:
+    d.setdefault(key, {})
+    existing = d[key].get("PATH","")
+    if "$HOME/.local/bin" not in existing:
+        d[key]["PATH"] = "$HOME/.local/bin:\${env:PATH}"
 p.write_text(json.dumps(d, indent=2))
 print("ok")
-PYEOF
-  ok "VS Code terminal PATH + tasks configured"
+PYEOF3
+  ok "VS Code terminal PATH configured"
 else
-  skip "VS Code settings not found"
+  skip "VS Code not found"
 fi
 
 # ── 6. Cursor ─────────────────────────────────────────────────
 step "Cursor..."
 CURSOR_SETTINGS="$HOME/Library/Application Support/Cursor/User/settings.json"
-if [ ! -f "$CURSOR_SETTINGS" ]; then
-  CURSOR_SETTINGS="$HOME/.config/Cursor/User/settings.json"
-fi
+[ ! -f "$CURSOR_SETTINGS" ] && CURSOR_SETTINGS="$HOME/.config/Cursor/User/settings.json"
 if [ -f "$CURSOR_SETTINGS" ]; then
-  python3 - << PYEOF
+  python3 - << PYEOF4
 import json, pathlib
 p = pathlib.Path("$CURSOR_SETTINGS")
-d = json.loads(p.read_text()) if p.exists() else {}
-d["terminal.integrated.env.osx"]  = d.get("terminal.integrated.env.osx", {})
-d["terminal.integrated.env.linux"] = d.get("terminal.integrated.env.linux", {})
-d["terminal.integrated.env.osx"]["PATH"]   = "$HOME/.local/bin:\${env:PATH}"
-d["terminal.integrated.env.linux"]["PATH"] = "$HOME/.local/bin:\${env:PATH}"
-# Cursor rules — tell the AI to be aware of OTK
+try:
+    d = json.loads(p.read_text())
+except:
+    d = {}
+for key in ["terminal.integrated.env.osx","terminal.integrated.env.linux"]:
+    d.setdefault(key, {})
+    if "$HOME/.local/bin" not in d[key].get("PATH",""):
+        d[key]["PATH"] = "$HOME/.local/bin:\${env:PATH}"
 rules_file = pathlib.Path.home() / ".cursorrules"
 existing = rules_file.read_text() if rules_file.exists() else ""
 if "OTK" not in existing:
-    rules_file.write_text(existing + "\n\n# OTK\nAll shell commands (git, npm, docker, etc.) are automatically routed through OTK (token killer). Output may be truncated/filtered to save tokens. This is expected behavior.\n")
+    rules_file.write_text(existing + "\n\n# OTK\nAll shell commands are routed through OTK (token killer). Filtered output is expected.\n")
 p.write_text(json.dumps(d, indent=2))
 print("ok")
-PYEOF
-  ok "Cursor terminal PATH + .cursorrules configured"
-elif command -v cursor &>/dev/null; then
-  warn "Cursor binary found but settings not located"
+PYEOF4
+  ok "Cursor configured"
 else
   skip "Cursor not found"
 fi
 
-# ── 7. Local API proxy (optional) ────────────────────────────
-step "Local API proxy..."
-PROXY_BIN="$HOME/.local/bin/otk-proxy"
-cat > "$PROXY_BIN" << 'PROXYEOF'
-#!/usr/bin/env python3
-"""
-OTK Proxy — intercepts OpenAI/Anthropic/Google API calls,
-filters tool results before forwarding. Run on localhost:8765.
-
-Configure your AI tool to use:
-  OpenAI base URL:    http://localhost:8765/openai
-  Anthropic base URL: http://localhost:8765/anthropic
-"""
-import sys
-try:
-    from fastapi import FastAPI, Request
-    from fastapi.responses import JSONResponse, StreamingResponse
-    import uvicorn, httpx, json, re
-except ImportError:
-    print("Installing dependencies...")
-    import subprocess
-    subprocess.run([sys.executable, "-m", "pip", "install", "fastapi", "uvicorn", "httpx", "-q"])
-    from fastapi import FastAPI, Request
-    from fastapi.responses import JSONResponse
-    import uvicorn, httpx, json, re
-
-app = FastAPI(title="OTK Proxy")
-
-def filter_tool_result(content: str) -> str:
-    lines = [l for l in content.splitlines() if l.strip()]
-    if len(lines) > 80:
-        h = 40
-        lines = lines[:h] + [f"... ({len(lines)-80} lines filtered by OTK) ..."] + lines[-h:]
-    return "\n".join(lines)
-
-def filter_messages(messages: list) -> list:
-    filtered = []
-    for msg in messages:
-        if isinstance(msg.get("content"), list):
-            new_content = []
-            for block in msg["content"]:
-                if block.get("type") == "tool_result":
-                    for part in block.get("content", []):
-                        if part.get("type") == "text":
-                            part["text"] = filter_tool_result(part["text"])
-                new_content.append(block)
-            msg = {**msg, "content": new_content}
-        elif isinstance(msg.get("content"), str) and msg.get("role") == "tool":
-            msg = {**msg, "content": filter_tool_result(msg["content"])}
-        filtered.append(msg)
-    return filtered
-
-@app.post("/openai/{path:path}")
-async def proxy_openai(path: str, request: Request):
-    body = await request.json()
-    if "messages" in body:
-        body["messages"] = filter_messages(body["messages"])
-    async with httpx.AsyncClient() as client:
-        headers = dict(request.headers)
-        headers.pop("host", None)
-        r = await client.post(f"https://api.openai.com/{path}", json=body, headers=headers, timeout=60)
-        return JSONResponse(r.json(), status_code=r.status_code)
-
-@app.post("/anthropic/{path:path}")
-async def proxy_anthropic(path: str, request: Request):
-    body = await request.json()
-    if "messages" in body:
-        body["messages"] = filter_messages(body["messages"])
-    async with httpx.AsyncClient() as client:
-        headers = dict(request.headers)
-        headers.pop("host", None)
-        r = await client.post(f"https://api.anthropic.com/{path}", json=body, headers=headers, timeout=60)
-        return JSONResponse(r.json(), status_code=r.status_code)
-
-@app.get("/")
-async def info():
-    return {"status":"OTK Proxy running","openai":"http://localhost:8765/openai","anthropic":"http://localhost:8765/anthropic"}
-
-if __name__ == "__main__":
-    print("OTK Proxy — listening on http://localhost:8765")
-    print("  OpenAI base URL:    http://localhost:8765/openai")
-    print("  Anthropic base URL: http://localhost:8765/anthropic")
-    uvicorn.run(app, host="127.0.0.1", port=8765)
-PROXYEOF
-chmod +x "$PROXY_BIN"
-ok "API proxy → $PROXY_BIN  (run: otk-proxy)"
-
-# ── 8. Verify ─────────────────────────────────────────────────
-step "Testing server connection..."
-if curl -sf --max-time 5 "$OTK_SERVER/api/gain" > /dev/null; then
-  ok "Server reachable: $OTK_SERVER"
-else
-  warn "Server unreachable — local filtering will be used as fallback"
+# ── 7. Verify ─────────────────────────────────────────────────
+if [ -n "$OTK_SERVER" ]; then
+  step "Testing server connection..."
+  HTTP_CODE=$(curl -sf --max-time 5 -o /dev/null -w "%{http_code}" "$OTK_SERVER/api/gain" 2>/dev/null || echo "000")
+  if [ "$HTTP_CODE" = "200" ] || [ "$HTTP_CODE" = "401" ]; then
+    ok "Server reachable: $OTK_SERVER"
+  else
+    warn "Server unreachable (HTTP $HTTP_CODE) — local filtering will be used as fallback"
+  fi
 fi
 
 # ── Summary ───────────────────────────────────────────────────
@@ -508,16 +465,14 @@ echo -e "\n${GREEN}════════════════════�
 echo -e "${GREEN}  ⚡ OTK installed — $MACHINE${NC}"
 echo -e "${GREEN}═══════════════════════════════════════════════════${NC}"
 echo ""
-echo "  Reload shell:      source ~/.zshrc"
-echo "  Check savings:     otk gain"
-echo "  Dashboard:         $OTK_SERVER/"
-echo "  API proxy:         otk-proxy  (then point tools to localhost:8765)"
+echo "  Reload shell:   source ~/.zshrc"
+echo "  Check savings:  otk gain"
+[ -n "$OTK_SERVER" ] && echo "  Dashboard:      $OTK_SERVER/dashboard"
 echo ""
 echo -e "${DIM}  Configured:${NC}"
-[ -d "$HOME/.claude" ]            && echo "  ✓ Claude Code (PreToolUse hook)"
-[ -f "$VSCODE_SETTINGS" ]         && echo "  ✓ VS Code (terminal PATH + tasks)"
-[ -f "$CURSOR_SETTINGS" ]         && echo "  ✓ Cursor (terminal PATH + .cursorrules)"
-command -v fish &>/dev/null        && echo "  ✓ Fish shell"
-                                      echo "  ✓ Zsh / Bash (shell functions)"
-                                      echo "  ✓ OTK API proxy (localhost:8765)"
+[ -d "$HOME/.claude" ]        && echo "  ✓ Claude Code (PreToolUse hook — all commands)"
+[ -f "$VSCODE_SETTINGS" ]     && echo "  ✓ VS Code"
+[ -f "$CURSOR_SETTINGS" ]     && echo "  ✓ Cursor"
+command -v fish &>/dev/null    && echo "  ✓ Fish shell"
+                                  echo "  ✓ Zsh / Bash (wraps: $OTK_CMDS)"
 echo ""
