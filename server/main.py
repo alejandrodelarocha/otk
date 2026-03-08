@@ -3,7 +3,7 @@
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse
-import sqlite3, json, time, os
+import sqlite3, json, time, os, re
 from pathlib import Path
 
 app = FastAPI()
@@ -41,20 +41,135 @@ def count_tokens_approx(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def strip_ansi(t: str) -> str:
+    import re
+    return re.sub(r'\x1b\[[0-9;]*[mKHJABCDGsu]', '', t)
+
+def dedup_lines(lines: list) -> list:
+    seen, out = set(), []
+    for l in lines:
+        k = l.strip()
+        if k and k not in seen:
+            seen.add(k)
+            out.append(l)
+    return out
+
+def truncate_lines(lines: list, n: int = 60) -> list:
+    if len(lines) <= n:
+        return lines
+    h = n // 2
+    omitted = len(lines) - n
+    return lines[:h] + [f"... ({omitted} lines omitted) ..."] + lines[-h:]
+
+def filter_git(lines: list, sub: str) -> list:
+    if sub == "diff":
+        # Keep only diff headers and changed lines, skip context lines
+        return [l for l in lines if l and (
+            l.startswith(("diff --git", "---", "+++", "@@", "index ", "new file", "deleted file"))
+            or (len(l) > 0 and l[0] in ("+", "-") and not l.startswith(("---", "+++")))
+        )]
+    if sub in ("log", "reflog"):
+        return lines[:40]  # ~20 commits
+    if sub == "status":
+        # Truncate untracked file list if huge, keep everything else
+        result, untracked, uc = [], False, 0
+        for l in lines:
+            if "Untracked files:" in l:
+                untracked = True; result.append(l)
+            elif untracked and l.startswith("\t"):
+                uc += 1
+                if uc <= 10: result.append(l)
+                elif uc == 11: result.append(f"\t... ({uc} more untracked files)")
+            else:
+                untracked = False; result.append(l)
+        return result
+    if sub in ("push", "fetch", "pull"):
+        # Drop object-counting progress lines, keep branch/remote info
+        noise = re.compile(r'^(Enumerating|Counting|Compressing|Writing|Total|remote: Counting|remote: Compressing) ')
+        return [l for l in lines if not noise.match(l)]
+    # add, commit, and everything else: pass through
+    return lines
+
+def filter_ls(lines: list) -> list:
+    return lines  # pass through — never hide files
+
+def filter_grep(lines: list) -> list:
+    # Drop binary file notices and permission errors, truncate only if massive
+    filtered = [l for l in lines if not re.match(r'^(Binary file|grep: )', l)]
+    return truncate_lines(filtered, 300)
+
+def filter_test(lines: list, tool: str) -> list:
+    # Noise patterns: lines that only show passing progress
+    noise = re.compile(
+        r'^(test .* \.\.\. ok'          # cargo: "test foo ... ok"
+        r'|\.+$'                         # pytest dots "......"
+        r'|ok\s+\S+\s+\([\d.]+s\)'      # go test: "ok  package (0.1s)"
+        r'|\s*PASS\s*$'                  # bare PASS line
+        r')',
+        re.I
+    )
+    important = re.compile(
+        r'(FAIL|ERROR|panic|assert|Exception|Traceback|FAILED|error\[|warning\[|\d+ (test|passed|failed|error))',
+        re.I
+    )
+    keep = [l for l in lines if not noise.match(l.strip()) or important.search(l)]
+    # Always keep last 10 lines (summary)
+    if lines:
+        for l in lines[-10:]:
+            if l not in keep:
+                keep.append(l)
+    return truncate_lines(keep, 100) if len(keep) < len(lines) else truncate_lines(lines, 100)
+
+def filter_cat(lines: list) -> list:
+    return truncate_lines(lines, 300)
+
+def filter_docker_ps(lines: list) -> list:
+    return truncate_lines(lines, 30)
+
 def filter_text(cmd: str, raw: str) -> str:
     import re
-    lines = raw.splitlines()
-    # Deduplicate
-    seen, result = set(), []
-    for line in lines:
-        clean = re.sub(r'\x1b\[[0-9;]*[mKHJABCDGsu]', '', line).strip()
-        if clean and clean not in seen:
-            seen.add(clean)
-            result.append(line)
-    # Truncate
-    if len(result) > 80:
-        omitted = len(result) - 80
-        result = result[:40] + [f"... ({omitted} lines omitted) ..."] + result[-40:]
+    lines = strip_ansi(raw).splitlines()
+    lines = [l for l in lines if l.strip()]  # drop blank lines
+
+    # Parse base command and subcommand
+    parts = cmd.strip().split()
+    base = parts[0].split("/")[-1] if parts else ""
+    sub = parts[1] if len(parts) > 1 else ""
+
+    if base == "git":
+        result = filter_git(lines, sub)
+    elif base in ("ls", "tree", "find"):
+        result = filter_ls(lines)
+    elif base in ("grep", "rg", "ag", "ack"):
+        result = filter_grep(lines)
+    elif base in ("cat", "head", "tail", "less", "more", "bat"):
+        result = filter_cat(lines)
+    elif base in ("pytest", "py.test"):
+        result = filter_test(lines, "pytest")
+    elif base in ("cargo",) and sub == "test":
+        result = filter_test(lines, "cargo")
+    elif base in ("go",) and sub == "test":
+        result = filter_test(lines, "go")
+    elif base in ("npm", "pnpm", "yarn") and sub in ("test", "run"):
+        result = filter_test(lines, base)
+    elif base in ("npm", "pnpm", "yarn") and sub in ("install", "i", "ci", "add"):
+        # Drop verbose progress/timing/http noise, keep warnings + summary
+        noise = re.compile(r'^(npm (warn EBADENGINE|timing|http|notice)|WARN deprecated)', re.I)
+        filtered_npm = [l for l in lines if not noise.match(l)]
+        # If we have a summary line, keep just that + any warnings
+        summary = [l for l in filtered_npm if re.search(r'added|removed|changed|packages in', l, re.I)]
+        warnings = [l for l in filtered_npm if re.search(r'warn|error', l, re.I)]
+        result = warnings + summary if (summary or warnings) else truncate_lines(filtered_npm, 20)
+    elif base == "ruff":
+        result = [l for l in lines if re.search(r'error|warning|Found|\d+ error', l, re.I)] or truncate_lines(lines, 20)
+    elif base == "docker" and sub == "ps":
+        result = filter_docker_ps(lines)
+    elif base == "docker" and sub == "build":
+        result = [l for l in lines if re.match(r'Step \d+|ERROR|-->', l)] or truncate_lines(lines, 20)
+    else:
+        # Generic: just truncate if massive, never dedup (could lose info)
+        result = truncate_lines(lines, 200)
+
     return "\n".join(result)
 
 
