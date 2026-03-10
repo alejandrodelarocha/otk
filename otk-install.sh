@@ -4,9 +4,9 @@
 #  Works with: Claude Code · Cursor · VS Code · any terminal
 #
 #  Usage:
-#    curl -fsSL https://alejandrodelarocha.com/otk/install | bash
-#    curl -fsSL https://alejandrodelarocha.com/otk/install | bash -s -- https://your-server.com
-#    curl -fsSL https://alejandrodelarocha.com/otk/install | bash -s -- --local   # no server
+#    curl -fsSL https://saveonllm.tech/install | bash
+#    curl -fsSL https://saveonllm.tech/install | bash -s -- https://your-server.com
+#    curl -fsSL https://saveonllm.tech/install | bash -s -- --local   # no server
 # ═══════════════════════════════════════════════════════════
 
 OTK_BIN="$HOME/.local/bin/otk"
@@ -459,6 +459,9 @@ if [ -n "$OTK_SERVER" ]; then
     warn "Server unreachable (HTTP $HTTP_CODE) — local filtering will be used as fallback"
   fi
 fi
+
+# Ping the dashboard
+otk ping 2>/dev/null || true
 
 # ── Summary ───────────────────────────────────────────────────
 echo -e "\n${GREEN}═══════════════════════════════════════════════════${NC}"
