@@ -1,450 +1,284 @@
 #!/usr/bin/env python3
-"""
-OTK - OpenAI Token Killer
-Same pattern as RTK: intercepts CLI commands, filters output, saves tokens.
-Usage: otk <command> [args...]
-       otk gain                        # Show token savings
-       otk gain --history              # Show command history
-       otk gain --model gpt            # Show savings with GPT-4o pricing
-       otk gain --model gemini         # Show savings with Gemini pricing
-       otk gain --model claude         # Show savings with Claude pricing
-       otk discover                    # Analyze shell history for missed opportunities
-
-Models:   gpt (default) | gpt4 | gpt4o | gemini | gemini-pro | claude | claude-opus
-"""
-
-import sys
-import subprocess
-import re
-import json
-import os
-import time
-import socket
+"""OTK - AI Token Killer (multi-tool client)"""
+import sys, subprocess, re, json, os, time, socket
 from pathlib import Path
 
-ANALYTICS_FILE = Path.home() / ".config" / "otk" / "analytics.json"
-CONFIG_FILE = Path.home() / ".config" / "otk" / "config.toml"
+ANALYTICS = Path.home() / ".config/otk/analytics.json"
+GAIN_CACHE = Path.home() / ".config/otk/gain_cache.json"
 
-DEFAULT_SERVER_URL = "https://alejandrodelarocha.com/otk"
-
-
-# ─── Config ───────────────────────────────────────────────────────────────────
-
-def load_config() -> dict:
-    config = {}
-    if CONFIG_FILE.exists():
-        for line in CONFIG_FILE.read_text().splitlines():
-            line = line.strip()
-            if "=" in line and not line.startswith("#"):
-                key, _, val = line.partition("=")
-                config[key.strip()] = val.strip().strip('"').strip("'")
-    return config
-
-
-def ensure_config():
-    """Write default config if missing."""
-    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    if not CONFIG_FILE.exists():
-        CONFIG_FILE.write_text(f'server_url = "{DEFAULT_SERVER_URL}"\n')
-    else:
-        content = CONFIG_FILE.read_text()
-        if "server_url" not in content:
-            with open(CONFIG_FILE, "a") as f:
-                f.write(f'\nserver_url = "{DEFAULT_SERVER_URL}"\n')
-
-
-def get_server_url():
-    # Env var takes priority
-    url = os.environ.get("OTK_SERVER")
-    if url:
-        return url.rstrip("/")
-    config = load_config()
-    url = config.get("server_url")
-    if url:
-        return url.rstrip("/")
+def get_server():
+    cfg = Path.home() / ".config/otk/config.toml"
+    if "OTK_SERVER" in os.environ:
+        return os.environ["OTK_SERVER"]
+    if cfg.exists():
+        for line in cfg.read_text().splitlines():
+            if line.startswith("server_url"):
+                v = line.split("=",1)[1].strip().strip('"')
+                return v if v else None
     return None
 
+def get_api_key():
+    if "OTK_API_KEY" in os.environ:
+        return os.environ["OTK_API_KEY"]
+    cfg = Path.home() / ".config/otk/config.toml"
+    if cfg.exists():
+        for line in cfg.read_text().splitlines():
+            if line.startswith("api_key"):
+                return line.split("=",1)[1].strip().strip('"')
+    return ""
 
-def get_machine_name() -> str:
-    return os.environ.get("OTK_MACHINE") or socket.gethostname()
+def strip_ansi(t): return re.sub(r'\x1b\[[0-9;]*[mKHJABCDGsu]','',t)
+def truncate(lines, n=200):
+    if len(lines)<=n: return lines
+    h=n//2; return lines[:h]+[f"...({len(lines)-n} omitted)..."]+lines[-h:]
 
-
-# ─── Filters ──────────────────────────────────────────────────────────────────
-
-def strip_ansi(text: str) -> str:
-    return re.sub(r'\x1b\[[0-9;]*[mKHJABCDGsu]', '', text)
-
-
-def dedup_lines(lines: list) -> list:
-    seen = set()
-    out = []
-    for line in lines:
-        if line not in seen:
-            seen.add(line)
-            out.append(line)
+def filter_git(out, sub):
+    lines = out.splitlines()
+    if sub=="diff":
+        return "\n".join(l for l in lines if l and (
+            l.startswith(("diff --git","---","+++","@@","index ","new file","deleted file"))
+            or (l[0] in ("+","-") and not l.startswith(("---","+++")))
+        ))
+    if sub in("log","reflog"): return "\n".join(lines[:40])
+    if sub=="status":
+        result, untracked, uc = [], False, 0
+        for l in lines:
+            if "Untracked files:" in l: untracked=True; result.append(l)
+            elif untracked and l.startswith("\t"):
+                uc+=1
+                if uc<=10: result.append(l)
+                elif uc==11: result.append(f"\t... and more untracked files")
+            else: untracked=False; result.append(l)
+        return "\n".join(result)
+    if sub in("push","fetch","pull"):
+        noise = re.compile(r'^(Enumerating|Counting|Compressing|Writing|Total|remote: Counting|remote: Compressing) ')
+        return "\n".join(l for l in lines if not noise.match(l))
     return out
-
-
-def truncate(lines: list, max_lines: int = 80) -> list:
-    if len(lines) <= max_lines:
-        return lines
-    half = max_lines // 2
-    omitted = len(lines) - max_lines
-    return lines[:half] + [f"... ({omitted} lines omitted) ..."] + lines[-half:]
-
-
-def filter_git(output: str, subcmd: str) -> str:
-    lines = output.splitlines()
-
-    if subcmd == "diff":
-        # Keep only changed lines + file headers, skip context lines
-        result = []
-        for line in lines:
-            if line.startswith(("diff --git", "---", "+++", "@@", "+", "-", "index ")):
-                result.append(line)
-        return "\n".join(result)
-
-    if subcmd in ("log", "reflog"):
-        # Keep first 20 commits
-        return "\n".join(lines[:40])
-
-    if subcmd == "status":
-        # Remove untracked section if > 10 files
-        result, in_untracked, untracked_count = [], False, 0
-        for line in lines:
-            if "Untracked files:" in line:
-                in_untracked = True
-                result.append(line)
-            elif in_untracked and line.startswith("\t"):
-                untracked_count += 1
-                if untracked_count <= 5:
-                    result.append(line)
-                elif untracked_count == 6:
-                    result.append(f"\t... and {len([l for l in lines if l.startswith(chr(9))]) - 5} more untracked files")
-            else:
-                in_untracked = False
-                result.append(line)
-        return "\n".join(result)
-
-    return output
-
-
-def filter_npm(output: str, subcmd: str) -> str:
-    lines = output.splitlines()
-    # Remove npm timing/audit/progress lines
-    filtered = [
-        l for l in lines
-        if not re.match(r'^npm (warn|notice|timing|http)', l, re.I)
-        and not l.startswith("added ") or subcmd == "install"
-    ]
-    # For install, just keep summary
-    if subcmd in ("install", "i", "ci"):
-        summary = [l for l in lines if re.match(r'added|removed|changed|audited|found', l)]
-        return "\n".join(summary) if summary else "\n".join(truncate(filtered))
+def filter_npm(out, sub):
+    lines = out.splitlines()
+    noise = re.compile(r'^(npm (warn EBADENGINE|timing|http|notice)|WARN deprecated)',re.I)
+    filtered = [l for l in lines if not noise.match(l)]
+    if sub in("install","i","ci","add"):
+        summary=[l for l in filtered if re.search(r'added|removed|changed|packages in',l,re.I)]
+        warnings=[l for l in filtered if re.search(r'warn|error',l,re.I)]
+        return "\n".join(warnings+summary) if (summary or warnings) else "\n".join(truncate(filtered,20))
     return "\n".join(truncate(filtered))
-
-
-def filter_docker(output: str, subcmd: str) -> str:
-    lines = output.splitlines()
-    if subcmd in ("build",):
-        # Keep only STEP lines and errors
-        return "\n".join(l for l in lines if re.match(r'Step \d+|ERROR|-->', l))
-    if subcmd == "ps":
-        return "\n".join(truncate(lines, 30))
+def filter_docker(out, sub):
+    lines = out.splitlines()
+    if sub=="build": return "\n".join(l for l in lines if re.match(r'Step \d+|ERROR|-->',l)) or "\n".join(truncate(lines,20))
+    if sub=="ps": return "\n".join(truncate(lines,30))
     return "\n".join(truncate(lines))
+def filter_test(out):
+    lines = out.splitlines()
+    noise=re.compile(r'^(test .* \.\.\. ok|\.+$|ok\s+\S+\s+\([\d.]+s\)|\s*PASS\s*$)',re.I)
+    important=re.compile(r'(FAIL|ERROR|panic|assert|Exception|Traceback|FAILED|error\[|\d+ (test|passed|failed|error))',re.I)
+    keep=[l for l in lines if not noise.match(l.strip()) or important.search(l)]
+    for l in lines[-10:]:
+        if l not in keep: keep.append(l)
+    return "\n".join(truncate(keep,100))
+def filter_output(cmd, raw):
+    if not cmd: return strip_ansi(raw)
+    base=cmd[0].split("/")[-1]; sub=cmd[1] if len(cmd)>1 else ""
+    clean=strip_ansi(raw)
+    lines=[l for l in clean.splitlines() if l.strip()]
+    if base=="git": return filter_git(clean, sub)
+    if base in("npm","pnpm","yarn"): return filter_npm(clean, sub)
+    if base=="docker": return filter_docker(clean, sub)
+    if base in("pytest","py.test"): return filter_test(clean)
+    if base=="cargo" and sub=="test": return filter_test(clean)
+    if base=="go" and sub=="test": return filter_test(clean)
+    if base in("grep","rg","ag"):
+        filtered=[l for l in lines if not re.match(r'^(Binary file|grep: )',l)]
+        return "\n".join(truncate(filtered,300))
+    if base in("ls","tree","find"): return clean  # never truncate file listings
+    return "\n".join(truncate(lines,200))
 
-
-def filter_generic(output: str) -> str:
-    lines = strip_ansi(output).splitlines()
-    lines = [l for l in lines if l.strip()]
-    lines = dedup_lines(lines)
-    lines = truncate(lines)
-    return "\n".join(lines)
-
-
-def filter_output(cmd: list, raw_output: str) -> str:
-    if not cmd:
-        return raw_output
-
-    base = cmd[0].split("/")[-1]  # handle full paths
-    subcmd = cmd[1] if len(cmd) > 1 else ""
-    clean = strip_ansi(raw_output)
-
-    if base == "git":
-        return filter_git(clean, subcmd)
-    if base in ("npm", "pnpm", "yarn"):
-        return filter_npm(clean, subcmd)
-    if base == "docker":
-        return filter_docker(clean, subcmd)
-
-    return filter_generic(clean)
-
-
-# ─── Model registry ───────────────────────────────────────────────────────────
-
-MODELS = {
-    # name           tiktoken_encoding  input_per_1m  output_per_1m  chars_per_token
-    "gpt":          ("cl100k_base",     2.50,          10.00,         None),
-    "gpt4":         ("cl100k_base",     30.00,         60.00,         None),
-    "gpt4o":        ("o200k_base",      2.50,          10.00,         None),
-    "gpt4o-mini":   ("o200k_base",      0.15,           0.60,         None),
-    "gemini":       (None,              0.075,          0.30,         4.2),   # Gemini 1.5 Flash
-    "gemini-pro":   (None,              1.25,           5.00,         4.2),   # Gemini 1.5 Pro
-    "claude":       ("cl100k_base",     3.00,          15.00,         None),  # Sonnet 4.6 approx
-    "claude-opus":  ("cl100k_base",     5.00,          25.00,         None),  # Opus 4.6
-}
-
-DEFAULT_MODEL = "claude"
-
-
-def resolve_model(name: str) -> str:
-    name = name.lower().strip()
-    aliases = {"gpt-4o": "gpt4o", "gpt-4": "gpt4", "gpt-3.5": "gpt", "opus": "claude-opus"}
-    return aliases.get(name, name)
-
-
-# ─── Token counting ───────────────────────────────────────────────────────────
-
-def count_tokens(text: str, model: str = DEFAULT_MODEL) -> int:
-    model = resolve_model(model)
-    encoding_name, _, _, chars_per_token = MODELS.get(model, MODELS[DEFAULT_MODEL])
-
-    if encoding_name:
-        try:
-            import tiktoken
-            enc = tiktoken.get_encoding(encoding_name)
-            return len(enc.encode(text))
-        except ImportError:
-            pass
-
-    # Fallback: char-based estimate
-    cpt = chars_per_token or 4.0
-    return int(len(text) / cpt)
-
-
-def tokens_to_cost(tokens: int, model: str, is_output: bool = False) -> float:
-    model = resolve_model(model)
-    _, input_price, output_price, _ = MODELS.get(model, MODELS[DEFAULT_MODEL])
-    price = output_price if is_output else input_price
-    return tokens * price / 1_000_000
-
-
-# ─── Analytics ────────────────────────────────────────────────────────────────
-
-def load_analytics() -> dict:
-    ANALYTICS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    if ANALYTICS_FILE.exists():
-        return json.loads(ANALYTICS_FILE.read_text())
-    return {"total_saved": 0, "total_original": 0, "runs": 0, "history": []}
-
-
-def save_analytics(data: dict):
-    ANALYTICS_FILE.write_text(json.dumps(data, indent=2))
-
-
-def record_run(cmd: list, original: int, filtered: int):
-    data = load_analytics()
-    saved = max(0, original - filtered)
-    data["total_saved"] += saved
-    data["total_original"] += original
-    data["runs"] += 1
-    data["history"].append({
-        "cmd": " ".join(cmd[:3]),
-        "original": original,
-        "filtered": filtered,
-        "saved": saved,
-        "pct": round(saved / original * 100) if original else 0,
-        "ts": int(time.time()),
-    })
-    # Keep last 100 entries
-    data["history"] = data["history"][-100:]
-    save_analytics(data)
-
-
-# ─── Server integration ────────────────────────────────────────────────────────
-
-def filter_via_server(server_url: str, cmd: list, raw_output: str):
-    """POST to server /api/filter. Returns filtered text or None on failure."""
+def count_tokens(t):
     try:
-        import urllib.request
-        import urllib.error
-        payload = json.dumps({
-            "cmd": " ".join(cmd[:3]),
-            "output": raw_output,
-            "machine": get_machine_name(),
-        }).encode()
+        import tiktoken
+        return max(1, len(tiktoken.get_encoding("cl100k_base").encode(t)))
+    except Exception:
+        return max(1, int(len(t)/4.0))
+
+GEMINI_KEY = "AIzaSyCMhKATgGP2gjZ8T3O7DjloZSTf1PGptHk"
+
+def filter_via_gemini(cmd, raw):
+    import urllib.request
+    if len(raw) < 200: return None, False
+    try:
+        prompt = f"Compress this CLI output for an AI coding assistant. Keep errors, warnings, key results, and actionable info. Remove noise, progress bars, and repetitive lines. Return ONLY the filtered output, no explanation.\n\nCommand: {' '.join(cmd[:5])}\n\nOutput:\n{raw[:8000]}"
+        payload = json.dumps({"contents":[{"parts":[{"text":prompt}]}],"generationConfig":{"maxOutputTokens":2000,"temperature":0.1}}).encode()
         req = urllib.request.Request(
-            f"{server_url}/api/filter",
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        ctx = None
+            f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={GEMINI_KEY}",
+            data=payload, headers={"Content-Type":"application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            d = json.loads(r.read())
+            text = d["candidates"][0]["content"]["parts"][0]["text"]
+            return text.strip(), False
+    except: return None, False
+
+def filter_via_server(cmd, raw):
+    import urllib.request
+    url = get_server()
+    if not url: return None, False
+    if len(raw) < 200: return (raw, False)
+    try:
+        payload = json.dumps({"cmd":" ".join(cmd),"output":raw,"machine":socket.gethostname()}).encode()
+        headers = {"Content-Type": "application/json"}
+        key = get_api_key()
+        if key: headers["X-OTK-Key"] = key
+        req = urllib.request.Request(url+"/api/filter", data=payload, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=2) as r:
+            d = json.loads(r.read())
+            return d["filtered"], d.get("privacy", False)
+    except: return None, False
+
+def load_analytics():
+    ANALYTICS.parent.mkdir(parents=True, exist_ok=True)
+    if ANALYTICS.exists(): return json.loads(ANALYTICS.read_text())
+    return {"total_saved":0,"total_original":0,"runs":0,"history":[]}
+def save_analytics(d): ANALYTICS.write_text(json.dumps(d,indent=2))
+
+def get_cached_gain():
+    import urllib.request
+    url = get_server()
+    if GAIN_CACHE.exists():
         try:
-            import ssl
-            ctx = ssl.create_default_context()
-        except Exception:
-            pass
-        with urllib.request.urlopen(req, timeout=2, context=ctx) as resp:
-            data = json.loads(resp.read())
-            return data.get("filtered", "")
-    except Exception:
-        return None
+            c = json.loads(GAIN_CACHE.read_text())
+            if time.time() - c.get("ts",0) < 60:
+                return c.get("gs",0), c.get("gr",0), c.get("gp",0)
+        except: pass
+    ga=load_analytics(); ls=ga["total_saved"]; lr=ga["runs"]; lo=ga["total_original"]
+    if url:
+        try:
+            key=get_api_key()
+            headers={"X-OTK-Key":key} if key else {}
+            req=urllib.request.Request(url+"/api/gain",headers=headers)
+            with urllib.request.urlopen(req,timeout=1) as r:
+                gd=json.loads(r.read())
+                ss,sr=gd.get("total_saved",0),gd.get("runs",0)
+                gs=ls+ss; gr=lr+sr
+                so=ss*100//max(gd.get("pct",1),1) if gd.get("pct") else 0
+                go=lo+so
+                gp=round(gs/go*100) if go else 0
+                GAIN_CACHE.parent.mkdir(parents=True,exist_ok=True)
+                GAIN_CACHE.write_text(json.dumps({"gs":gs,"gr":gr,"gp":gp,"ts":time.time()}))
+                return gs,gr,gp
+        except: pass
+    gp=round(ls/lo*100) if lo else 0
+    return ls,lr,gp
 
-
-def fetch_gain_from_server(server_url: str):
-    """GET /api/gain from server. Returns parsed JSON or None."""
+def record(cmd, orig, filt):
+    saved=max(0,orig-filt); d=load_analytics()
+    d["total_saved"]+=saved; d["total_original"]+=orig; d["runs"]+=1
+    d["history"].append({"cmd":" ".join(cmd[:3]),"original":orig,"filtered":filt,"saved":saved,"pct":round(saved/orig*100) if orig else 0,"ts":int(time.time())})
+    d["history"]=d["history"][-100:]; save_analytics(d)
+    # Sync to server (fire-and-forget)
     try:
         import urllib.request
-        ctx = None
+        url=get_server(); key=get_api_key()
+        if url:
+            payload=json.dumps({"cmd":" ".join(cmd[:3]),"original":orig,"filtered":filt,"saved":saved,"machine":socket.gethostname()}).encode()
+            hd={"Content-Type":"application/json"}
+            if key: hd["X-OTK-Key"]=key
+            req=urllib.request.Request(url+"/api/record",data=payload,headers=hd,method="POST")
+            urllib.request.urlopen(req,timeout=2)
+    except: pass
+
+def cmd_gain(history=False, model="claude-sonnet"):
+    PRICES={"claude-sonnet":3.0,"claude-opus":15.0,"gpt-4o":2.5,"gpt-4":30.0,"gpt-4o-mini":0.15,"gemini-flash":0.075,"gemini-pro":1.25}
+    price=PRICES.get(model,3.0)
+    BLUE="\033[0;34m"; DIM="\033[2m"; NC="\033[0m"; BOLD="\033[1m"
+    import urllib.request
+    url=get_server()
+    # Load local stats
+    ld=load_analytics(); l_saved=ld["total_saved"]; l_runs=ld["runs"]; l_orig=ld["total_original"]
+    # Try server stats
+    s_saved=s_runs=0; has_server=False
+    if url:
         try:
-            import ssl
-            ctx = ssl.create_default_context()
-        except Exception:
-            pass
-        with urllib.request.urlopen(f"{server_url}/api/gain", timeout=3, context=ctx) as resp:
-            return json.loads(resp.read())
-    except Exception:
-        return None
+            key=get_api_key()
+            _h={"X-OTK-Key":key} if key else {}
+            with urllib.request.urlopen(urllib.request.Request(url+"/api/gain",headers=_h),timeout=3) as r:
+                sd=json.loads(r.read())
+            s_saved=sd.get("total_saved",0); s_runs=sd.get("runs",0)
+            has_server=True
+        except: pass
+    # Combine
+    saved=l_saved+s_saved; runs=l_runs+s_runs
+    pct=round(saved/l_orig*100) if l_orig else 0
+    cost=saved*price/1_000_000
+    src="LOCAL+VPS" if has_server else "LOCAL"
+    print(f"OTK Savings [{model} @ ${price}/1M] -- {src}"); print("-"*44)
+    print(f"  Runs:       {runs:,}")
+    print(f"  Saved:      {BLUE}{BOLD}{saved:,} tokens ({pct}%){NC}")
+    print(f"  Cost saved: {BLUE}{BOLD}${cost:.6f}{NC}")
+    if has_server:
+        print(f"  {DIM}(local: {l_saved:,} | vps: {s_saved:,}){NC}")
+    if history:
+        print("\nRecent (local):")
+        for e in reversed(ld.get("history",[])[-10:]):
+            print(f"  {e['cmd']:<30} {BLUE}-{e['pct']}%{NC}")
 
+def cmd_ping():
+    import urllib.request
+    url=get_server()
+    if not url: print("otk: no server configured",file=sys.stderr); sys.exit(1)
+    try:
+        payload=json.dumps({"machine":socket.gethostname(),"event":"ping"}).encode()
+        req=urllib.request.Request(url+"/api/ping",data=payload,headers={"Content-Type":"application/json"},method="POST")
+        urllib.request.urlopen(req,timeout=3)
+        print("✓ Dashboard pinged")
+    except Exception as e:
+        print(f"otk: ping failed: {e}",file=sys.stderr); sys.exit(1)
 
-# ─── Meta commands ─────────────────────────────────────────────────────────────
-
-def cmd_gain(history: bool = False, model: str = DEFAULT_MODEL):
-    model = resolve_model(model)
-    model_label = model if model in MODELS else DEFAULT_MODEL
-    _, input_price, _, _ = MODELS.get(model_label, MODELS[DEFAULT_MODEL])
-
-    server_url = get_server_url()
-    server_data = None
-    if server_url:
-        server_data = fetch_gain_from_server(server_url)
-
-    if server_data:
-        total = server_data.get("total_original", 0)
-        saved = server_data.get("total_saved", 0)
-        runs = server_data.get("runs", 0)
-        pct = server_data.get("pct", 0)
-        cost_saved = tokens_to_cost(saved, model_label)
-        machines = server_data.get("machines", [])
-
-        print(f"OTK Token Savings  [{model_label} @ ${input_price}/1M tokens]  [server: {server_url}]")
-        print(f"──────────────────────────────────────────")
-        print(f"  Runs:          {runs}")
-        print(f"  Original:      {total:,} tokens")
-        print(f"  After filter:  {total - saved:,} tokens")
-        print(f"  Saved:         {saved:,} tokens ({pct}%)")
-        print(f"  Cost saved:    ${cost_saved:.6f}")
-
-        if machines:
-            print(f"\nMachines:")
-            for m in machines:
-                print(f"  {m['machine']:<30} runs={m['runs']} saved={m['total_saved']:,} ({m['avg_pct']}%)")
-
-        if history:
-            recent = server_data.get("recent", [])
-            if recent:
-                print(f"\nRecent commands:")
-                for entry in recent:
-                    entry_cost = tokens_to_cost(entry["saved"], model_label)
-                    print(f"  {entry['cmd']:<30} -{entry['pct']}% ({entry['saved']:,} tokens, ${entry_cost:.6f})")
-        return
-
-    # Fall back to local analytics
-    data = load_analytics()
-    total = data["total_original"]
-    saved = data["total_saved"]
-    runs = data["runs"]
-    pct = round(saved / total * 100) if total else 0
-    cost_saved = tokens_to_cost(saved, model_label)
-
-    print(f"OTK Token Savings  [{model_label} @ ${input_price}/1M tokens]")
-    print(f"──────────────────────────────────────────")
-    print(f"  Runs:          {runs}")
-    print(f"  Original:      {total:,} tokens")
-    print(f"  After filter:  {total - saved:,} tokens")
-    print(f"  Saved:         {saved:,} tokens ({pct}%)")
-    print(f"  Cost saved:    ${cost_saved:.6f}")
-
-    if history and data["history"]:
-        print(f"\nRecent commands:")
-        for entry in reversed(data["history"][-20:]):
-            entry_cost = tokens_to_cost(entry["saved"], model_label)
-            print(f"  {entry['cmd']:<30} -{entry['pct']}% ({entry['saved']:,} tokens, ${entry_cost:.6f})")
-
-
-def cmd_discover():
-    history_file = Path.home() / ".zsh_history"
-    if not history_file.exists():
-        history_file = Path.home() / ".bash_history"
-    if not history_file.exists():
-        print("No shell history found.")
-        return
-
-    text = history_file.read_text(errors="ignore")
-    cmds = re.findall(r'(?:;|^)\s*(git|npm|docker|pnpm|yarn|pip|cargo)\s+\S+', text, re.MULTILINE)
-    from collections import Counter
-    counts = Counter(cmds)
-    print("Top commands that could use OTK filtering:")
-    for cmd, count in counts.most_common(15):
-        print(f"  {cmd:<35} {count}x")
-
-
-# ─── Main ──────────────────────────────────────────────────────────────────────
+def check_auth():
+    key = get_api_key()
+    if not key: return True  # no key configured = local-only mode
+    auth_file = Path.home() / ".config/otk/.authenticated"
+    if auth_file.exists():
+        stored = auth_file.read_text().strip()
+        if stored == key: return True
+    # Key exists in config -- auto-authenticate (user already has it)
+    auth_file.parent.mkdir(parents=True, exist_ok=True)
+    auth_file.write_text(key)
+    return True
 
 def main():
-    ensure_config()
-    args = sys.argv[1:]
-
-    if not args:
-        print(__doc__)
-        sys.exit(0)
-
-    # Meta commands
-    if args[0] in ("gain", "-gain", "--gain", "-g"):
-        model = DEFAULT_MODEL
-        for i, a in enumerate(args):
-            if a == "--model" and i + 1 < len(args):
-                model = args[i + 1]
-        cmd_gain(history="--history" in args, model=model)
-        return
-    if args[0] == "discover":
-        cmd_discover()
-        return
-    if args[0] == "proxy":
-        # Run raw without filtering
-        result = subprocess.run(args[1:])
-        sys.exit(result.returncode)
-
-    # Run the command and filter its output
+    args=sys.argv[1:]
+    if not args: print(__doc__); sys.exit(0)
+    if args[0]=="gain":
+        model="claude-sonnet"
+        for i,a in enumerate(args):
+            if a=="--model" and i+1<len(args): model=args[i+1]
+        check_auth()
+        cmd_gain("--history" in args, model); return
+    if args[0]=="ping": check_auth(); cmd_ping(); return
+    if args[0]=="proxy": check_auth(); sys.exit(subprocess.run(args[1:]).returncode)
+    check_auth()
     try:
-        result = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-        )
+        result=subprocess.run(args,capture_output=True,text=True)
     except FileNotFoundError:
-        print(f"otk: command not found: {args[0]}", file=sys.stderr)
-        sys.exit(127)
-
-    raw = result.stdout + result.stderr
-
-    # Try server-side filtering first, fall back to local
-    server_url = get_server_url()
-    filtered = None
-    if server_url:
-        filtered = filter_via_server(server_url, args, raw)
-
+        print(f"otk: command not found: {args[0]}",file=sys.stderr); sys.exit(127)
+    raw=result.stdout+result.stderr
+    filtered,privacy=filter_via_server(args,raw)
     if filtered is None:
-        filtered = filter_output(args, raw)
-        # Record locally only when server is unavailable
-        original_tokens = count_tokens(raw)
-        filtered_tokens = count_tokens(filtered)
-        record_run(args, original_tokens, filtered_tokens)
-
-    print(filtered, end="" if filtered.endswith("\n") else "\n")
+        filtered,privacy=filter_via_gemini(args,raw)
+    if filtered is None:
+        filtered=filter_output(args,raw); privacy=False
+    orig_tok=count_tokens(raw); filt_tok=count_tokens(filtered)
+    record(args,orig_tok,filt_tok)
+    BLUE="\033[0;34m"; DIM="\033[2m"; NC="\033[0m"; YELLOW="\033[0;33m"
+    print(f"{BLUE}{filtered}{NC}",end="" if filtered.endswith("\n") else "\n")
+    if privacy:
+        print(f"{DIM}  * otk: {YELLOW}skipped AI -- sensitive data detected (privacy){NC}",file=sys.stderr)
+    else:
+        saved=max(0,orig_tok-filt_tok); pct=round(saved/orig_tok*100) if orig_tok else 0
+        gs,gr,gp=get_cached_gain(); gcost=gs*3.0/1_000_000
+        if saved==0:
+            print(f"{DIM}  * otk: nothing to compress ({orig_tok:,} tokens) | total {BLUE}{gs:,} saved ({gp}%) ${gcost:.4f}{NC}{DIM} across {gr} runs{NC}",file=sys.stderr)
+        else:
+            print(f"{DIM}  * otk: {BLUE}{saved:,} tokens saved ({pct}%){NC}{DIM} | {orig_tok:,}->{filt_tok:,} | total {gs:,} saved ({gp}%) ${gcost:.4f} across {gr} runs{NC}",file=sys.stderr)
     sys.exit(result.returncode)
 
-
-if __name__ == "__main__":
-    main()
+if __name__=="__main__": main()
