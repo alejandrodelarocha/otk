@@ -7,6 +7,29 @@ services:
       - "7654:7654"
     volumes:
       - otk-data:/data
+      - endlessh-log:/endlessh-log:ro
+
+  endlessh:
+    image: lscr.io/linuxserver/endlessh:latest
+    container_name: endlessh
+    restart: unless-stopped
+    ports:
+      - "22:2222"
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=Etc/UTC
+      - MSDELAY=10000
+      - MAXLINES=32
+      - MAXCLIENTS=1000000
+      - LOGFILE=true
+    ulimits:
+      nofile:
+        soft: 1048576
+        hard: 1048576
+    volumes:
+      - endlessh-log:/config/log
 
 volumes:
   otk-data:
+  endlessh-log:

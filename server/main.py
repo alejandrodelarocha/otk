@@ -239,6 +239,64 @@ def api_gain(request: Request):
     }
 
 
+ENDLESSH_LOG = Path(os.environ.get("ENDLESSH_LOG", "/endlessh-log/endlessh.log"))
+ENDLESSH_LINE = re.compile(
+    r'host=(?P<ip>[0-9a-fA-F:.]+).*?time=(?P<time>[0-9.]+).*?bytes=(?P<bytes>\d+)'
+)
+
+
+def parse_endlessh():
+    if not ENDLESSH_LOG.exists():
+        return {"total_connections": 0, "total_seconds": 0.0, "total_bytes": 0,
+                "top_ips": [], "recent": []}
+    from collections import defaultdict
+    agg = defaultdict(lambda: {"hits": 0, "seconds": 0.0, "bytes": 0})
+    recent = []
+    total_conn = 0
+    total_secs = 0.0
+    total_bytes = 0
+    try:
+        with ENDLESSH_LOG.open("r", errors="ignore") as f:
+            for line in f:
+                if "CLOSE" not in line:
+                    continue
+                m = ENDLESSH_LINE.search(line)
+                if not m:
+                    continue
+                ip = m.group("ip")
+                secs = float(m.group("time"))
+                b = int(m.group("bytes"))
+                agg[ip]["hits"] += 1
+                agg[ip]["seconds"] += secs
+                agg[ip]["bytes"] += b
+                total_conn += 1
+                total_secs += secs
+                total_bytes += b
+                recent.append({"ip": ip, "seconds": round(secs, 1), "bytes": b})
+    except OSError:
+        pass
+    top = sorted(
+        ({"ip": ip, **vals} for ip, vals in agg.items()),
+        key=lambda r: r["seconds"], reverse=True,
+    )[:20]
+    for t in top:
+        t["seconds"] = round(t["seconds"], 1)
+    return {
+        "total_connections": total_conn,
+        "total_seconds": round(total_secs, 1),
+        "total_bytes": total_bytes,
+        "top_ips": top,
+        "recent": recent[-20:][::-1],
+    }
+
+
+@app.get("/api/endlessh")
+def api_endlessh(request: Request):
+    if not check_auth(request):
+        return JSONResponse({"error": "unauthorized"}, status_code=401)
+    return parse_endlessh()
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     return HTMLResponse("""<!DOCTYPE html>
@@ -290,11 +348,33 @@ def dashboard():
   <table><thead><tr><th>Command</th><th>Saved</th><th>%</th></tr></thead>
   <tbody id="recent-table"></tbody></table>
 </div>
+<div class="grid">
+  <div class="card"><div class="label">SSH Attempts Trapped</div><div class="value" id="tarpit-conn">—</div><div class="sub">total connections</div></div>
+  <div class="card"><div class="label">Attacker Time Wasted</div><div class="value" id="tarpit-time">—</div><div class="sub">cumulative seconds</div></div>
+  <div class="card"><div class="label">Unique IPs</div><div class="value" id="tarpit-ips">—</div><div class="sub">attempting ssh</div></div>
+  <div class="card"><div class="label">Bytes Sent</div><div class="value" id="tarpit-bytes">—</div><div class="sub">slow banner drip</div></div>
+</div>
+<div class="section">
+  <h2>Top Trapped IPs</h2>
+  <table><thead><tr><th>IP</th><th>Hits</th><th>Seconds Wasted</th><th>Bytes</th></tr></thead>
+  <tbody id="tarpit-top"></tbody></table>
+</div>
+<div class="section">
+  <h2>Recent Tarpit Closes</h2>
+  <table><thead><tr><th>IP</th><th>Seconds</th><th>Bytes</th></tr></thead>
+  <tbody id="tarpit-recent"></tbody></table>
+</div>
 <script>
+const fmt = n => n >= 1000 ? (n/1000).toFixed(1)+'K' : n;
+const fmtTime = s => {
+  if (s < 60) return s.toFixed(0)+'s';
+  if (s < 3600) return (s/60).toFixed(1)+'m';
+  if (s < 86400) return (s/3600).toFixed(1)+'h';
+  return (s/86400).toFixed(1)+'d';
+};
 async function load() {
   const r = await fetch('/api/gain');
   const d = await r.json();
-  const fmt = n => n >= 1000 ? (n/1000).toFixed(1)+'K' : n;
   const cost = (d.total_saved * 3 / 1000000).toFixed(4);
   document.getElementById('saved').textContent = fmt(d.total_saved);
   document.getElementById('pct').textContent = d.pct + '% reduction';
@@ -313,8 +393,24 @@ async function load() {
     `<tr><td>${r.cmd}</td><td>${fmt(r.saved)}</td><td>${r.pct}%</td></tr>`
   ).join('');
 }
+async function loadTarpit() {
+  const r = await fetch('/api/endlessh');
+  const d = await r.json();
+  document.getElementById('tarpit-conn').textContent = fmt(d.total_connections);
+  document.getElementById('tarpit-time').textContent = fmtTime(d.total_seconds);
+  document.getElementById('tarpit-ips').textContent = d.top_ips.length;
+  document.getElementById('tarpit-bytes').textContent = fmt(d.total_bytes);
+  document.getElementById('tarpit-top').innerHTML = d.top_ips.map(t =>
+    `<tr><td>${t.ip}</td><td>${t.hits}</td><td>${fmtTime(t.seconds)}</td><td>${fmt(t.bytes)}</td></tr>`
+  ).join('');
+  document.getElementById('tarpit-recent').innerHTML = d.recent.map(t =>
+    `<tr><td>${t.ip}</td><td>${fmtTime(t.seconds)}</td><td>${fmt(t.bytes)}</td></tr>`
+  ).join('');
+}
 load();
+loadTarpit();
 setInterval(load, 10000);
+setInterval(loadTarpit, 10000);
 </script>
 </body>
 </html>""")
